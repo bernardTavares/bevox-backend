@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Dependabot detects pnpm via pnpm-lock.yaml; the ecosystem key for
+  # pnpm/yarn/npm projects is "npm" (there is no "pnpm" ecosystem value).
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      types:
+        patterns: ["@types/*"]
+      dev:
+        dependency-type: development
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly

@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "refunds_org_provider_refund_uniq" ON "refunds" USING btree ("organization_id","provider_refund_id") WHERE provider_refund_id IS NOT NULL;

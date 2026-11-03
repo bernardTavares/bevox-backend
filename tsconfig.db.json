@@ -1,0 +1,29 @@
+{
+  // R3 build-config support (Task 2): compila o schema Drizzle de `db/`
+  // para dentro de `dist/` SEM alterar o contrato flat de `dist/index.js`
+  // (esse vem de `tsconfig.build.json`, rootDir:./src). Aqui rootDir é a
+  // raiz do projeto: emite `dist/db/schema/*.js` (alvo do `await import()`
+  // dinâmico em initDb) e a dep `dist/src/shared/uuid.js` (R2 — única SoT
+  // UUIDv7). tsc-alias reescreve `@/*` e `@db/*` para relativos nesses .js.
+  // `db/seed.ts` é excluído: roda só via tsx (CLI/dev), nunca no dist flat,
+  // e importa `@/plugins/*` (fora deste grafo mínimo).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": ".",
+    "outDir": "./dist",
+    "sourceMap": true,
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": ["db/schema/**/*.ts"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "coverage",
+    "test/**",
+    "db/seed.ts",
+    "**/*.test.ts",
+    "**/*.spec.ts"
+  ]
+}

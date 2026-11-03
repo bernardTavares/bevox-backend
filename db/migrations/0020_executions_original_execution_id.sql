@@ -1,0 +1,1 @@
+ALTER TABLE "executions" ADD COLUMN "original_execution_id" uuid;

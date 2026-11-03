@@ -1,0 +1,1 @@
+ALTER TABLE "message_records" ADD COLUMN "media_json" jsonb;

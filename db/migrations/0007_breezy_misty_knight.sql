@@ -1,0 +1,1 @@
+CREATE INDEX "staff_manual_actions_execution_created_idx" ON "staff_manual_actions" USING btree ("execution_id","created_at");

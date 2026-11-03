@@ -1,0 +1,3113 @@
+openapi: 3.1.0
+info:
+  title: bevox-backend
+  version: 1.11.0
+  description: |
+    API de domínio Bevox — monolito Fastify, Marco 1.
+
+    Superfície canônica do PRD bevox-backend (consume-by-reference, ADR-005:
+    `$BEVOX_KNOWLEDGE_PATH/10_prd/bevox-backend/2026-05-15-bevox-backend-prd-v1.md`).
+
+    Identidade de tenant = `organizationId` (TS) / `organization_id` (DB,
+    path param) / tabela `organizations`. Fonte: canon `_shared` / ADR-021
+    (aceita; supersedes hub-ADR-003). Esta spec é `organizationId`-only — o
+    léxico de tenant legado NÃO aparece aqui; ele vive apenas na ponte de
+    fronteira do harness em `src/integration/`.
+
+    Três modelos de autenticação:
+      - `clerkBearer` — JWT Clerk (usuários do produto / cliente-final).
+      - `staffBearer` — JWT staff Bevox HS256 (painel staff; roles
+        `bevox_admin|bevox_support|bevox_observer`, ADR-013).
+      - `executionToken` — header `X-Execution-Token` (callbacks do harness).
+  license:
+    name: Proprietary — Bevox
+servers:
+  - url: http://localhost:3000
+    description: Local dev
+tags:
+  - name: health
+    description: Liveness / readiness / métricas
+  - name: staff
+    description: Sessões e impersonation de staff Bevox (ADR-013)
+  - name: staff-ops
+    description: |
+      Ops cross-org (painel staff) (Módulo 17, B4) — reads (qualquer role staff),
+      SSE realtime e 6 ações manuais (bevox_admin|bevox_support; observer
+      NÃO). Reconciliação own-domain do orchestration-service (ADR-019).
+  - name: webhooks
+    description: Webhooks de provedores externos
+  - name: organizations
+    description: CRUD de organizations + sub-recursos (cliente-final)
+  - name: professionals
+    description: CRUD de profissionais (scoped por organization)
+  - name: services
+    description: CRUD de serviços (scoped por organization)
+  - name: customers
+    description: CRUD de clientes finais (scoped por organization)
+  - name: harness
+    description: Callbacks do bevox-harness (X-Execution-Token)
+  - name: approvals
+    description: |
+      Ciclo human-in-the-loop sobre execuções (bevox-backend/ADR-019 —
+      supersedes hub ADR-025; PRD §5.6 Módulo 9). Fila pendente +
+      approve/edit/reject. Scoped por organization (clerkBearer).
+  - name: calendar
+    description: |
+      Agenda (M3-C1) — calendars, disponibilidade e appointments
+      (scoped por organization). slot_conflict ⇒ 409.
+  - name: meta-api
+    description: bevox-meta-api gateway consumer (inbound + health)
+
+components:
+  securitySchemes:
+    clerkBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT Clerk de usuário do produto (cliente-final).
+    staffBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT staff Bevox HS256 (painel staff). Roles bevox_admin|bevox_support|bevox_observer.
+    executionToken:
+      type: apiKey
+      in: header
+      name: X-Execution-Token
+      description: Token efêmero por execução; autentica callbacks do harness.
+  parameters:
+    OrganizationId:
+      name: organization_id
+      in: path
+      required: true
+      description: ID da organization (UUIDv7, ADR-021).
+      schema:
+        type: string
+        format: uuid
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Chave de idempotência obrigatória em toda mutação.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 200
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              examples: ["NOT_FOUND", "FORBIDDEN", "INVALID_INPUT"]
+            message:
+              type: string
+            details:
+              type: object
+              additionalProperties: true
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: "Canonical error code per PRD §9.4 (ex: RATE_LIMITED, NOT_FOUND, VALIDATION_FAILED)"
+            message:
+              type: string
+              description: "Human-readable message (may be translated)"
+            details:
+              type: object
+              additionalProperties: true
+              nullable: true
+            request_id:
+              type: string
+              description: "Server-side request correlation id"
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          examples: ["ok"]
+    Readiness:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        checks:
+          type: object
+          additionalProperties: true
+    StaffLogin:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        password:
+          type: string
+          minLength: 1
+          maxLength: 512
+    StaffRefresh:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+          maxLength: 200
+    StaffTokens:
+      type: object
+      required: [access_token, refresh_token]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_in:
+          type: integer
+    StaffOpsActionBody:
+      type: object
+      required: [reason]
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          description: Justificativa obrigatória; vai para ledger + AuditEvent.
+    StaffOpsActionResult:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        new_execution_id:
+          type: string
+          format: uuid
+          description: Presente em ações que re-dispatcham (replay, dead-letter replay, override-ai).
+    ImpersonationStart:
+      type: object
+      required: [reason, category]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        category:
+          type: string
+          enum: [support, audit, incident]
+    ImpersonationResult:
+      type: object
+      additionalProperties: true
+    MetaApiEventEnvelope:
+      type: object
+      required: [event_id, event_type, occurred_at, data]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: UUIDv7 — used for Redis dedupe (TTL 24h)
+        event_type:
+          type: string
+          description: "Canonical: message.received|message.status_updated|template.status_updated|phone_number.quality_changed|waba.connection_changed; or raw.* fallback"
+        tenant_id:
+          type: [string, "null"]
+          format: uuid
+          description: meta-api tenant UUIDv7 (mapped to backend organization)
+        occurred_at:
+          type: string
+          format: date-time
+        data:
+          type: object
+          additionalProperties: true
+    MetaApiVerificationChallenge:
+      type: object
+      required: [verification_challenge]
+      properties:
+        verification_challenge:
+          type: string
+          minLength: 1
+          maxLength: 128
+    OrganizationPatch:
+      type: object
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        business_name: { type: string, minLength: 1, maxLength: 200 }
+        legal_name: { type: string, maxLength: 200 }
+        niche: { type: string, minLength: 1, maxLength: 120 }
+        timezone: { type: string, minLength: 1, maxLength: 64 }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+        locale: { type: string, minLength: 2, maxLength: 12 }
+      additionalProperties: false
+    SettingsPatch:
+      type: object
+      properties:
+        default_reply_tone: { type: [string, "null"], maxLength: 120 }
+        default_language: { type: [string, "null"], maxLength: 12 }
+      additionalProperties: false
+    OnboardingAdvance:
+      type: object
+      required: [stage]
+      properties:
+        stage:
+          type: string
+          enum:
+            - welcome
+            - business_profile
+            - professionals
+            - services
+            - schedule
+            - calendar_sync
+            - channels
+            - payments
+            - knowledge
+            - manual_assisted
+            - copilot_active
+      additionalProperties: false
+    GenericResource:
+      type: object
+      additionalProperties: true
+    ResourceList:
+      type: array
+      items:
+        $ref: "#/components/schemas/GenericResource"
+    ExecutionStatusCallback:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [running, paused, cancelled]
+    ExecutionTracesCallback:
+      type: object
+      required: [traces]
+      properties:
+        traces:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    ExecutionStreamCallback:
+      type: object
+      required: [chunk, index]
+      properties:
+        chunk:
+          type: string
+          maxLength: 4096
+        index:
+          type: integer
+          minimum: 0
+    ExecutionProposal:
+      type: object
+      required: [action, params, idempotency_key]
+      properties:
+        action:
+          type: string
+          enum:
+            - create-appointment
+            - cancel-appointment
+            - reschedule-appointment
+            - create-charge
+            - send-message
+            - waitlist-add
+        params:
+          type: object
+          additionalProperties: true
+        idempotency_key:
+          type: string
+          minLength: 1
+    ExecutionCompleteCallback:
+      type: object
+      required: [response_text, sentiment, strategy, usage]
+      properties:
+        response_text:
+          type: string
+        sentiment:
+          type: string
+          enum: [positive, neutral, negative, frustrated, angry, confused]
+        strategy:
+          type: string
+          enum: [direct, react, plan-execute, rewoo, workflow, request-human, failed]
+        usage:
+          type: object
+          required: [prompt_tokens, completion_tokens]
+          properties:
+            prompt_tokens: { type: integer, minimum: 0 }
+            completion_tokens: { type: integer, minimum: 0 }
+        proposals:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExecutionProposal"
+      additionalProperties: true
+    PendingExecution:
+      type: object
+      description: |
+        Item da fila de execuções aguardando aprovação humana
+        (bevox-backend/ADR-019 — supersedes hub ADR-025). Forma do row
+        retornado por `listPendingApprovals` em
+        `src/modules/executions/repository.ts`.
+      required: [id, organization_id, conversation_id, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Execution id (UUIDv7).
+        organization_id:
+          type: string
+          format: uuid
+        conversation_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          description: |
+            Status atual da execução. Em V1 o filtro default é
+            `waiting_approval`; o cliente pode pedir outros status via
+            query param `status`.
+          examples: ["waiting_approval"]
+        result_payload:
+          type: [object, "null"]
+          additionalProperties: true
+          description: |
+            Payload bruto produzido pelo harness. Pode incluir
+            `response_text`, `proposals[]`, `suggestion_type` etc.
+    PendingExecutionList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/PendingExecution"
+    ExecutionEditBody:
+      type: object
+      additionalProperties: false
+      required: [response_text]
+      description: |
+        Edita o `response_text` antes de aprovar a execução
+        (bevox-backend/ADR-019).
+      properties:
+        response_text:
+          type: string
+          minLength: 1
+    ExecutionRejectBody:
+      type: object
+      additionalProperties: false
+      required: [rejection_reason_code]
+      description: |
+        Justifica a rejeição da execução pelo aprovador humano
+        (bevox-backend/ADR-019). `rejection_reason_code` é canônico (vai
+        para audit + métricas); `rejection_reason_text` é livre.
+      properties:
+        rejection_reason_code:
+          type: string
+          minLength: 1
+        rejection_reason_text:
+          type: string
+    ExecutionApprovalResult:
+      type: object
+      required: [id, status]
+      description: |
+        Resultado de approve/edit. `status: done` indica que a transição
+        foi guardada e seams (proposals + delivery) rodaram com sucesso.
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [done]
+    ExecutionRejectionResult:
+      type: object
+      required: [id, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [rejected]
+  responses:
+    BadRequest:
+      description: Input inválido
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Não autenticado
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Sem permissão / fora do escopo
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Recurso não encontrado
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Conflito (idempotência / corrida de estado)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Processo vivo
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /readyz:
+    get:
+      tags: [health]
+      summary: Readiness probe (Postgres + Redis)
+      security: []
+      responses:
+        "200":
+          description: Pronto
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Readiness"
+        "503":
+          description: Não pronto
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Readiness"
+  /metrics:
+    get:
+      tags: [health]
+      summary: Prometheus scrape endpoint
+      security: []
+      responses:
+        "200":
+          description: Exposição Prometheus (text/plain)
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/v1/staff/sessions:
+    post:
+      tags: [staff]
+      summary: Login de staff Bevox
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StaffLogin"
+      responses:
+        "200":
+          description: Tokens de sessão staff
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StaffTokens"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v1/staff/sessions/refresh:
+    post:
+      tags: [staff]
+      summary: Rotacionar refresh token de staff
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StaffRefresh"
+      responses:
+        "200":
+          description: Novos tokens
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StaffTokens"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v1/staff/impersonation/{organization_id}/start:
+    post:
+      tags: [staff]
+      summary: Iniciar impersonation (bevox_admin|bevox_support)
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImpersonationStart"
+      responses:
+        "200":
+          description: Sessão de impersonation criada (AuditEvent emitido)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImpersonationResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/staff/impersonation/{organization_id}/end:
+    post:
+      tags: [staff]
+      summary: Encerrar impersonation ativa
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+      responses:
+        "200":
+          description: Impersonation encerrada (AuditEvent emitido)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImpersonationResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/staff/dashboard/overview:
+    get:
+      tags: [staff-ops]
+      summary: Visão geral do dashboard ops (cross-org)
+      security:
+        - staffBearer: []
+      parameters:
+        - name: organization_id
+          in: query
+          required: false
+          description: Filtro opcional por organization_id (cross-org se ausente).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Agregados do dashboard ops
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/staff/executions:
+    get:
+      tags: [staff-ops]
+      summary: Listar execuções (cross-org, paginado)
+      security:
+        - staffBearer: []
+      parameters:
+        - name: organization_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+        - name: per_page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: Página de execuções
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/staff/executions/{id}:
+    get:
+      tags: [staff-ops]
+      summary: Detalhe de execução
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Execução
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/staff/executions/{id}/traces:
+    get:
+      tags: [staff-ops]
+      summary: Traces de execução
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Traces da execução
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/staff/executions/{id}/reasoning:
+    get:
+      tags: [staff-ops]
+      summary: Reasoning da execução
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Reasoning da execução
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/staff/executions/{id}/intents:
+    get:
+      tags: [staff-ops]
+      summary: Intents da execução
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Intents da execução
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/staff/conversations/{id}/executions:
+    get:
+      tags: [staff-ops]
+      summary: Execuções de uma conversa
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Execuções da conversa
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/staff/windows:
+    get:
+      tags: [staff-ops]
+      summary: Listar buffer windows (cross-org, paginado)
+      security:
+        - staffBearer: []
+      parameters:
+        - name: organization_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+        - name: per_page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: Página de windows
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/staff/windows/{id}:
+    get:
+      tags: [staff-ops]
+      summary: Detalhe de buffer window
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Window
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/staff/dead-letters:
+    get:
+      tags: [staff-ops]
+      summary: Listar dead-letters (cross-org, paginado)
+      security:
+        - staffBearer: []
+      parameters:
+        - name: organization_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+        - name: per_page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: Página de dead-letters
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/staff/organization-health:
+    get:
+      tags: [staff-ops]
+      summary: Saúde por organization (cross-org)
+      security:
+        - staffBearer: []
+      parameters:
+        - name: organization_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Indicadores de saúde por organization
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/staff/audit-events:
+    get:
+      tags: [staff-ops]
+      summary: Listar audit events (cross-org, paginado)
+      security:
+        - staffBearer: []
+      parameters:
+        - name: organization_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: entity_type
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: entity_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: actor_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+        - name: per_page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: Página de audit events
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/staff/realtime/events:
+    get:
+      tags: [staff-ops]
+      summary: Stream SSE cross-org de eventos realtime
+      description: |
+        Server-Sent Events (`text/event-stream`). psubscribe `realtime:*`
+        (staff vê todas as organizations). Conexão long-lived com
+        heartbeat; sem corpo de resposta JSON.
+      security:
+        - staffBearer: []
+      responses:
+        "200":
+          description: Stream SSE aberto
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/staff/executions/{id}/replay:
+    post:
+      tags: [staff-ops]
+      summary: Replay de execução (status error|dead_letter)
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StaffOpsActionBody"
+      responses:
+        "200":
+          description: Re-dispatch efetuado (ledger + AuditEvent emitido)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StaffOpsActionResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/staff/executions/{id}/cancel:
+    post:
+      tags: [staff-ops]
+      summary: Cancelar execução (status dispatching|processing)
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StaffOpsActionBody"
+      responses:
+        "200":
+          description: Execução cancelada (ledger + AuditEvent emitido)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StaffOpsActionResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/staff/executions/{id}/override-ai:
+    post:
+      tags: [staff-ops]
+      summary: Override AI — cancela ativo (se houver) e re-dispatcha
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StaffOpsActionBody"
+      responses:
+        "200":
+          description: Override AI aplicado (ledger + AuditEvent emitido)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StaffOpsActionResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/staff/executions/{id}/override-human:
+    post:
+      tags: [staff-ops]
+      summary: Override Human — conversa → waiting_human (cancela ativo)
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StaffOpsActionBody"
+      responses:
+        "200":
+          description: Override Human aplicado (ledger + AuditEvent emitido)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StaffOpsActionResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/staff/executions/{id}/unlock:
+    post:
+      tags: [staff-ops]
+      summary: Unlock — limpa lease do pipeline (processing → error)
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StaffOpsActionBody"
+      responses:
+        "200":
+          description: Lease limpo (ledger + AuditEvent emitido)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StaffOpsActionResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/staff/dead-letters/{id}/replay:
+    post:
+      tags: [staff-ops]
+      summary: Replay de dead-letter (status dead_letter)
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StaffOpsActionBody"
+      responses:
+        "200":
+          description: Dead-letter re-dispatchado (ledger + AuditEvent emitido)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StaffOpsActionResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/webhooks/clerk:
+    post:
+      tags: [webhooks]
+      summary: Webhook Clerk (verificação Svix)
+      security: []
+      description: |
+        Body raw verificado via assinatura Svix (`svix-id`,
+        `svix-timestamp`, `svix-signature`). Assinatura inválida = rejeição.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Evento processado
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/webhooks/metaapi/events:
+    post:
+      tags: [meta-api]
+      summary: bevox-meta-api inbound webhook (push delivery)
+      security: []
+      description: |
+        Receives webhook deliveries from bevox-meta-api gateway.
+        Two body shapes:
+        - Verification challenge `{verification_challenge: string}` → 200 `{challenge: <echo>}`, no HMAC required.
+        - Canonical event `{event_id, event_type, tenant_id, occurred_at, data}` → HMAC validated via `X-Bevox-Signature` Stripe-style `t=<unix>,v1=<hex>`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/MetaApiVerificationChallenge"
+                - $ref: "#/components/schemas/MetaApiEventEnvelope"
+      responses:
+        "200":
+          description: Accepted or challenge echoed
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/health/metaapi:
+    get:
+      tags: [meta-api]
+      summary: bevox-meta-api consumer health-check
+      description: Staff-only. Verifies JWT mint + subscription active + tenant mapping complete.
+      security:
+        - staffBearer: []
+      responses:
+        "200":
+          description: All checks ok
+        "503":
+          description: One or more checks failed
+
+  /api/v1/organizations/{organization_id}:
+    get:
+      tags: [organizations]
+      summary: Obter organization
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+      responses:
+        "200":
+          description: Organization
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [organizations]
+      summary: Atualizar organization
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrganizationPatch"
+      responses:
+        "200":
+          description: Organization atualizada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/organizations/{organization_id}/settings:
+    get:
+      tags: [organizations]
+      summary: Obter settings da organization
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+      responses:
+        "200":
+          description: Settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    patch:
+      tags: [organizations]
+      summary: Atualizar settings da organization
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SettingsPatch"
+      responses:
+        "200":
+          description: Settings atualizadas
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/organizations/{organization_id}/users:
+    get:
+      tags: [organizations]
+      summary: Listar usuários da organization
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+      responses:
+        "200":
+          description: Lista de usuários
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResourceList"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/organizations/{organization_id}/onboarding:
+    get:
+      tags: [organizations]
+      summary: Estado de onboarding
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+      responses:
+        "200":
+          description: Estado de onboarding
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/organizations/{organization_id}/onboarding/advance:
+    post:
+      tags: [organizations]
+      summary: Avançar estágio de onboarding
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OnboardingAdvance"
+      responses:
+        "200":
+          description: Estágio avançado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/organizations/{organization_id}/professionals:
+    get:
+      tags: [professionals]
+      summary: Listar profissionais
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+      responses:
+        "200":
+          description: Lista de profissionais
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResourceList"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [professionals]
+      summary: Criar profissional
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenericResource"
+      responses:
+        "201":
+          description: Profissional criado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/organizations/{organization_id}/professionals/{id}:
+    get:
+      tags: [professionals]
+      summary: Obter profissional
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Profissional
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [professionals]
+      summary: Atualizar profissional
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenericResource"
+      responses:
+        "200":
+          description: Profissional atualizado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [professionals]
+      summary: Remover profissional (soft-delete)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Profissional removido
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/organizations/{organization_id}/services:
+    get:
+      tags: [services]
+      summary: Listar serviços
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+      responses:
+        "200":
+          description: Lista de serviços
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResourceList"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [services]
+      summary: Criar serviço
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenericResource"
+      responses:
+        "201":
+          description: Serviço criado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/organizations/{organization_id}/services/{id}:
+    get:
+      tags: [services]
+      summary: Obter serviço
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Serviço
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [services]
+      summary: Atualizar serviço
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenericResource"
+      responses:
+        "200":
+          description: Serviço atualizado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [services]
+      summary: Remover serviço (soft-delete)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Serviço removido
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/organizations/{organization_id}/services/{id}/professionals:
+    get:
+      tags: [services]
+      summary: Listar profissionais habilitados a um serviço
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Profissionais do serviço
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResourceList"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/organizations/{organization_id}/customers:
+    get:
+      tags: [customers]
+      summary: Listar clientes finais
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+      responses:
+        "200":
+          description: Lista de clientes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResourceList"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [customers]
+      summary: Criar cliente final
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenericResource"
+      responses:
+        "201":
+          description: Cliente criado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/organizations/{organization_id}/customers/{id}:
+    get:
+      tags: [customers]
+      summary: Obter cliente final
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Cliente
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [customers]
+      summary: Atualizar cliente final
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenericResource"
+      responses:
+        "200":
+          description: Cliente atualizado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/customers/{id}/profile:
+    get:
+      tags: [customers]
+      summary: Perfil consolidado do cliente (escopo via principal autenticado)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Perfil do cliente
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/customers/{id}/facts:
+    get:
+      tags: [customers]
+      summary: Listar fatos do cliente
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Fatos do cliente
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResourceList"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [customers]
+      summary: Adicionar fato ao cliente
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenericResource"
+      responses:
+        "201":
+          description: Fato adicionado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericResource"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/organizations/{organization_id}/executions:
+    get:
+      tags: [approvals]
+      summary: Listar execuções aguardando aprovação humana
+      description: |
+        Fila de execuções `waiting_approval` (default) ou outro status
+        explícito, opcionalmente filtradas por `suggestion_type`
+        (`reply|slot|charge|refund`). LIMIT 200 hardcoded no repository;
+        paginação real é follow-on. Scoped pelo `organizationId` do
+        principal Clerk (`requireOrganizationScope`).
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: status
+          in: query
+          required: false
+          description: Status da execução. Default = `waiting_approval`.
+          schema:
+            type: string
+        - name: suggestion_type
+          in: query
+          required: false
+          description: |
+            Filtra por `result_payload->>'suggestion_type'`. Enum casa
+            com `listQuerySchema` em `src/modules/executions/schemas.ts`.
+          schema:
+            type: string
+            enum: [reply, slot, charge, refund]
+      responses:
+        "200":
+          description: Página da fila (ordenada por created_at DESC, LIMIT 200)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingExecutionList"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/organizations/{organization_id}/executions/{id}/approve:
+    post:
+      tags: [approvals]
+      summary: Aprovar execução (transição waiting_approval → done)
+      description: |
+        Aprova a execução pendente. Roda os seams (proposals +
+        delivery) e transiciona para `done`. 409 se a execução não
+        estiver em `waiting_approval` (reaprovar = conflict; idempotência
+        de transição é guarded). 409 também em `slot_conflict` quando o
+        slot proposto pela IA já foi ocupado (ADR-011 §133).
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Execução aprovada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecutionApprovalResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/organizations/{organization_id}/executions/{id}/edit:
+    post:
+      tags: [approvals]
+      summary: Editar response_text antes de aprovar
+      description: |
+        Substitui o `response_text` proposto pela IA e aprova a execução
+        no mesmo passo (transição waiting_approval → done). Mesmas
+        semânticas de conflito do approve.
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecutionEditBody"
+      responses:
+        "200":
+          description: Execução editada e aprovada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecutionApprovalResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v1/organizations/{organization_id}/executions/{id}/reject:
+    post:
+      tags: [approvals]
+      summary: Rejeitar execução (transição waiting_approval → rejected)
+      description: |
+        Rejeita a execução pendente com motivo canônico
+        (`rejection_reason_code`) e opcionalmente texto livre
+        (`rejection_reason_text`). 409 se não estiver em
+        `waiting_approval`.
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecutionRejectBody"
+      responses:
+        "200":
+          description: Execução rejeitada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecutionRejectionResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/executions/{id}/status:
+    patch:
+      tags: [harness]
+      summary: Callback do harness — transição de status da execução
+      security:
+        - executionToken: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecutionStatusCallback"
+      responses:
+        "200":
+          description: Transição aplicada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/executions/{id}/traces:
+    post:
+      tags: [harness]
+      summary: Callback do harness — entradas de trace (stub Marco 1)
+      security:
+        - executionToken: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecutionTracesCallback"
+      responses:
+        "200":
+          description: Traces aceitos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v1/executions/{id}/stream:
+    post:
+      tags: [harness]
+      summary: Callback do harness — chunk de stream (stub Marco 1)
+      security:
+        - executionToken: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecutionStreamCallback"
+      responses:
+        "200":
+          description: Chunk aceito
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: boolean }
+                  index: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v1/executions/{id}/complete:
+    post:
+      tags: [harness]
+      summary: Callback do harness — execução concluída (stub Marco 1)
+      security:
+        - executionToken: []
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecutionCompleteCallback"
+      responses:
+        "200":
+          description: Execução concluída
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/organizations/{organization_id}/calendars:
+    get:
+      tags: [calendar]
+      summary: Listar calendars da organization
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+      responses:
+        "200":
+          description: Lista de calendars
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [calendar]
+      summary: Criar calendar
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              additionalProperties: false
+              properties:
+                name: { type: string, minLength: 1 }
+                timezone: { type: string, minLength: 1, default: "America/Sao_Paulo" }
+      responses:
+        "201":
+          description: Calendar criado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  calendar:
+                    type: object
+                    additionalProperties: true
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/organizations/{organization_id}/professionals/{professionalId}/schedule-overrides:
+    post:
+      tags: [calendar]
+      summary: Criar professional schedule override (block/extra/holiday)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: professionalId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date, type]
+              additionalProperties: false
+              properties:
+                date: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$', example: "2026-06-10" }
+                type: { type: string, enum: [block, extra, holiday] }
+                start_time: { type: string, pattern: '^\d{2}:\d{2}$', example: "14:00" }
+                end_time: { type: string, pattern: '^\d{2}:\d{2}$', example: "18:00" }
+                reason: { type: string, minLength: 1, maxLength: 500 }
+      responses:
+        "201":
+          description: Schedule override criado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schedule_override:
+                    type: object
+                    additionalProperties: true
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/organizations/{organization_id}/calendars/{id}/availability:
+    get:
+      tags: [calendar]
+      summary: Slots disponíveis por intervalo de datas
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - name: service_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: date_from
+          in: query
+          required: true
+          schema: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$' }
+        - name: date_to
+          in: query
+          required: true
+          schema: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$' }
+      responses:
+        "200":
+          description: Disponibilidade por dia
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  days:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/organizations/{organization_id}/calendars/{id}/appointments:
+    post:
+      tags: [calendar]
+      summary: Criar appointment (slot_conflict ⇒ 409)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [service_id, date, start_time]
+              additionalProperties: false
+              properties:
+                service_id: { type: string, format: uuid }
+                professional_id: { type: string, format: uuid }
+                customer_id: { type: string, format: uuid }
+                customer_name: { type: string, minLength: 1 }
+                customer_phone: { type: string }
+                customer_email: { type: string, format: email }
+                date: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$' }
+                start_time: { type: string, pattern: '^\d{2}:\d{2}$' }
+                metadata: { type: object, additionalProperties: true }
+      responses:
+        "201":
+          description: Appointment criado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  appointment_id: { type: string, format: uuid }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/organizations/{organization_id}/appointments/{id}:
+    patch:
+      tags: [calendar]
+      summary: Reagendar appointment (start_time obrigatório; slot_conflict ⇒ 409)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                date: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$' }
+                start_time: { type: string, pattern: '^\d{2}:\d{2}$' }
+                professional_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Appointment reagendado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  appointment_id: { type: string, format: uuid }
+        "400":
+          description: |
+            Input inválido — inclui ausência de `start_time`
+            (INVALID_INPUT / HTTP 400: um novo `start_time` é
+            obrigatório para reagendar).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/v1/organizations/{organization_id}/appointments/{id}/cancel:
+    post:
+      tags: [calendar]
+      summary: Cancelar appointment
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: { type: string }
+      responses:
+        "200":
+          description: Appointment cancelado
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/organizations/{organization_id}/appointments/{id}/confirm:
+    post:
+      tags: [calendar]
+      summary: Confirmar appointment
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Appointment confirmado
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/organizations/{organization_id}/appointments/{id}/complete:
+    post:
+      tags: [calendar]
+      summary: Concluir appointment
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Appointment concluído
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/organizations/{organization_id}/appointments/{id}/no-show:
+    post:
+      tags: [calendar]
+      summary: Marcar appointment como no-show
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Appointment marcado como no-show
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # C3 Waitlist — endpoints org-scoped do cliente (Clerk + organization-scope).
+  /api/v1/organizations/{organization_id}/calendars/{calendarId}/waitlist-entries:
+    post:
+      tags: [calendar]
+      summary: Criar waitlist entry
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: calendarId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                service_id: { type: string, format: uuid }
+                professional_id: { type: string, format: uuid }
+                customer_id: { type: string, format: uuid }
+                customer_name: { type: string, minLength: 1, maxLength: 200 }
+                customer_phone: { type: string, minLength: 1, maxLength: 40 }
+                customer_email: { type: string, format: email }
+                preferred_date_from: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$' }
+                preferred_date_to: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$' }
+                preferred_time_from: { type: string, pattern: '^\d{2}:\d{2}$' }
+                preferred_time_to: { type: string, pattern: '^\d{2}:\d{2}$' }
+                priority_score: { type: number }
+      responses:
+        "201":
+          description: Waitlist entry criada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  waitlist_entry:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    get:
+      tags: [calendar]
+      summary: Listar waitlist entries do calendar
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: calendarId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, minLength: 1 }
+      responses:
+        "200":
+          description: Lista de waitlist entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/organizations/{organization_id}/waitlist-entries/{id}:
+    get:
+      tags: [calendar]
+      summary: Obter waitlist entry
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Waitlist entry
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  waitlist_entry:
+                    type: object
+                    additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [calendar]
+      summary: Atualizar waitlist entry (prioridade/contato/cancelar)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                priority_score: { type: number }
+                priority: { type: integer }
+                customer_name: { type: string, minLength: 1, maxLength: 200 }
+                customer_phone: { type: string, minLength: 1, maxLength: 40 }
+                customer_email: { type: string, format: email }
+                status: { type: string, enum: [cancelled] }
+      responses:
+        "200":
+          description: Waitlist entry atualizada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/organizations/{organization_id}/waitlist-entries/{id}/accept:
+    post:
+      tags: [calendar]
+      summary: Aceitar oferta de waitlist (cria appointment; slot_conflict ⇒ 409)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "201":
+          description: Appointment criado a partir da oferta aceita
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  appointment_id: { type: string, format: uuid }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  # C2 Google Calendar — endpoints org-scoped do cliente (Clerk +
+  # organization-scope). Os 2 webhooks públicos (GET callback, POST push)
+  # NÃO são documentados aqui: por política de webhook HMAC server-to-
+  # server (não-cliente, autenticado por HMAC/redirect — same pattern
+  # used by metaapi inbound em /api/v1/webhooks/metaapi/events). Lexicon
+  # ADR-021.
+  /api/v1/organizations/{organization_id}/calendars/{id}/google/connect:
+    get:
+      tags: [calendar]
+      summary: Iniciar conexão Google Calendar (retorna authorize_url)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+        - name: professional_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: URL de autorização OAuth do Google
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authorize_url: { type: string, format: uri }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/organizations/{organization_id}/calendars/{id}/google/connections:
+    get:
+      tags: [calendar]
+      summary: Listar conexões Google Calendar do calendar
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Lista de conexões
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/organizations/{organization_id}/google/connections/{connection_id}/disconnect:
+    post:
+      tags: [calendar]
+      summary: Desconectar (revogar) conexão Google Calendar
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: connection_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Conexão revogada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # Payments P1 — Stripe Connect Express (ADR-010). Conta org-level.
+  # Os 2 redirects públicos (connect-return / connect-refresh) NÃO têm
+  # security: são alvos de redirect do fluxo de onboarding Stripe,
+  # autenticados pelo query param `org` + estado externo Stripe — mesma
+  # política dos webhooks Google/metaapi. POST /webhooks/stripe (assinatura
+  # HMAC, não-cliente) fica fora da superfície OpenAPI por precedente.
+  /api/v1/organizations/{organization_id}/payment-account/connect:
+    post:
+      tags: [payments]
+      summary: Criar/retomar onboarding Stripe Connect da organização
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "201":
+          description: Account link de onboarding criado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  onboarding_url: { type: string, format: uri }
+                  payment_account:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      onboarding_status: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502":
+          description: Falha ao comunicar com o provider (Stripe)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /api/v1/organizations/{organization_id}/payment-account:
+    get:
+      tags: [payments]
+      summary: Obter payment account org-level (reconcile-on-read se stale)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+      responses:
+        "200":
+          description: Payment account da organização
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payment_account:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      organization_id: { type: string, format: uuid }
+                      account_holder_type: { type: string }
+                      external_account_id: { type: string, nullable: true }
+                      onboarding_status: { type: string }
+                      charges_enabled: { type: boolean }
+                      payouts_enabled: { type: boolean }
+                      details_submitted: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/organizations/{organization_id}/charges:
+    post:
+      tags: [payments]
+      summary: Criar charge Pix (destination charge + application_fee)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [customer_id, amount_total, charge_type]
+              properties:
+                customer_id: { type: string, format: uuid }
+                appointment_id: { type: string, format: uuid }
+                service_id: { type: string, format: uuid }
+                professional_id: { type: string, format: uuid }
+                service_package_id: { type: string, format: uuid, description: Obrigatório quando charge_type=package }
+                amount_total: { type: number }
+                charge_type: { type: string, enum: [full, package] }
+                currency: { type: string, default: BRL }
+                payment_method: { type: string, enum: [pix], default: pix }
+      responses:
+        "201":
+          description: Charge criada (Pix provisionado ou já em estado terminal)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  charge_id: { type: string, format: uuid }
+                  status: { type: string }
+                  pix:
+                    type: object
+                    nullable: true
+                    properties:
+                      qr_code: { type: string }
+                      copy_paste: { type: string }
+                      expires_at: { type: string, format: date-time }
+                      hosted_instructions_url: { type: string, nullable: true }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Criação de charge já em andamento (contenção; retryable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        "502":
+          description: Falha ao comunicar com o provider (Stripe)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /api/v1/organizations/{organization_id}/charges/{charge_id}:
+    get:
+      tags: [payments]
+      summary: Obter charge por id (status expired derivado on-read)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: charge_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Charge encontrada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  charge:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      organization_id: { type: string, format: uuid }
+                      customer_id: { type: string, format: uuid, nullable: true }
+                      appointment_id: { type: string, format: uuid, nullable: true }
+                      service_id: { type: string, format: uuid, nullable: true }
+                      professional_id: { type: string, format: uuid, nullable: true }
+                      payment_account_id: { type: string, format: uuid }
+                      charge_type: { type: string, enum: [deposit, full, package, adjustment] }
+                      status:
+                        type: string
+                        enum: [pending, paid, expired, cancelled, refunded]
+                        description: expired é derivado on-read (pending + expires_at no passado); o status persistido permanece pending até o reconcile-cron (follow-on)
+                      amount_total: { type: string }
+                      amount_platform_fee: { type: string, nullable: true }
+                      currency: { type: string }
+                      payment_method: { type: string, nullable: true }
+                      expires_at: { type: string, format: date-time, nullable: true }
+                      paid_at: { type: string, format: date-time, nullable: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/organizations/{organization_id}/charges/{charge_id}/refund:
+    post:
+      tags: [payments]
+      summary: Iniciar estorno (full ou partial) de uma charge paga
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - name: charge_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [amount, reason_code]
+              properties:
+                amount:
+                  type: number
+                  description: Valor a estornar em reais (full ou partial; faixa (0, charge.amount_total])
+                reason_code:
+                  type: string
+                  minLength: 1
+                  maxLength: 64
+                  description: Motivo do estorno (PRD §12.5, obrigatório)
+      responses:
+        "201":
+          description: Estorno iniciado (pending, succeeded ou failed conforme o Stripe retornar)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  refund:
+                    type: object
+                    properties:
+                      provider_refund_id: { type: string }
+                      status: { type: string, enum: [pending, succeeded, failed] }
+                      amount: { type: number }
+                      reason_code: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Estorno já em andamento para esta charge (contenção; retryable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        "502":
+          description: Falha ao comunicar com o provider (Stripe)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /api/v1/organizations/{organization_id}/service-packages:
+    post:
+      tags: [payments]
+      summary: Criar ServicePackage no catálogo da org
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, sessions_included, price_amount]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 120 }
+                service_id: { type: string, format: uuid }
+                sessions_included: { type: integer, minimum: 1 }
+                price_amount: { type: number }
+                validity_days: { type: integer, minimum: 1 }
+      responses:
+        "201":
+          description: ServicePackage criado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service_package:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      organization_id: { type: string, format: uuid }
+                      name: { type: string }
+                      service_id: { type: string, format: uuid, nullable: true }
+                      sessions_included: { type: string }
+                      price_amount: { type: string }
+                      validity_days: { type: string, nullable: true }
+                      is_active: { type: boolean }
+                      created_at: { type: string, format: date-time }
+                      updated_at: { type: string, format: date-time }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    get:
+      tags: [payments]
+      summary: Listar ServicePackages da org (default active-only)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: include_inactive
+          in: query
+          required: false
+          schema: { type: string, enum: ["true", "false"], default: "false" }
+      responses:
+        "200":
+          description: Lista
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service_packages:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        organization_id: { type: string, format: uuid }
+                        name: { type: string }
+                        service_id: { type: string, format: uuid, nullable: true }
+                        sessions_included: { type: string }
+                        price_amount: { type: string }
+                        validity_days: { type: string, nullable: true }
+                        is_active: { type: boolean }
+                        created_at: { type: string, format: date-time }
+                        updated_at: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/organizations/{organization_id}/customer-packages:
+    get:
+      tags: [payments]
+      summary: Listar CustomerPackages por cliente (effective-on-read expiry)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: customer_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: include_terminal
+          in: query
+          required: false
+          schema: { type: string, enum: ["true", "false"], default: "false" }
+      responses:
+        "200":
+          description: Lista
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  customer_packages:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        organization_id: { type: string, format: uuid }
+                        customer_id: { type: string, format: uuid }
+                        service_package_id: { type: string, format: uuid }
+                        charge_id: { type: string, format: uuid, nullable: true }
+                        status:
+                          type: string
+                          enum: [active, exhausted, expired, cancelled]
+                          description: expired pode vir derivado on-read (active + valid_until passado); persisted transiciona via cron noturno
+                        sessions_total: { type: string }
+                        sessions_used: { type: string }
+                        sessions_remaining: { type: string }
+                        valid_until: { type: string, format: date, nullable: true }
+                        created_at: { type: string, format: date-time }
+                        updated_at: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  # Payments M5-P4 — Manual Payment Mode (canon ADR-023). A org gerencia o
+  # dinheiro fora-de-banda (cash, pix manual, transferência); Bevox só registra
+  # no ledger. Conta org-level provider='manual', ativa sem Stripe Connect/KYC.
+  # connect-manual / mark-paid / expire NÃO usam Idempotency-Key (idempotência
+  # vem da construção do service); charges/manual + refund-manual usam.
+  /api/v1/organizations/{organization_id}/payment-account/connect-manual:
+    post:
+      tags: [payments]
+      summary: Configurar (idempotente) o modo de pagamento manual da organização
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+      responses:
+        "201":
+          description: Conta manual configurada (ativa imediatamente)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payment_account:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      onboarding_status: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/organizations/{organization_id}/charges/manual:
+    post:
+      tags: [payments]
+      summary: Criar charge manual (pending; sem Stripe/Pix)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [customer_id, amount_total, charge_type]
+              properties:
+                customer_id: { type: string, format: uuid }
+                appointment_id: { type: string, format: uuid }
+                service_id: { type: string, format: uuid }
+                professional_id: { type: string, format: uuid }
+                service_package_id: { type: string, format: uuid, description: Obrigatório quando charge_type=package }
+                amount_total: { type: number, exclusiveMinimum: 0 }
+                charge_type: { type: string, enum: [full, package] }
+                currency: { type: string, default: BRL }
+                payment_method:
+                  type: string
+                  enum: [cash, pix_manual, bank_transfer, boleto_manual, card_manual, other]
+      responses:
+        "201":
+          description: Charge manual criada (status pending)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  charge_id: { type: string, format: uuid }
+                  status: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/organizations/{organization_id}/charges/{charge_id}/mark-paid:
+    post:
+      tags: [payments]
+      summary: Marcar charge manual como paga (converge p/ efeitos paid do Stripe)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: charge_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [paid_at, payment_method, reason]
+              properties:
+                paid_at: { type: string, format: date-time }
+                payment_method:
+                  type: string
+                  enum: [cash, pix_manual, bank_transfer, boleto_manual, card_manual, other]
+                reference: { type: string, maxLength: 200 }
+                reason: { type: string, minLength: 1, maxLength: 500 }
+      responses:
+        "200":
+          description: Charge marcada como paga
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  charge_id: { type: string, format: uuid }
+                  status: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Mark-paid já em andamento para esta charge (contenção; retryable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /api/v1/organizations/{organization_id}/charges/{charge_id}/refund-manual:
+    post:
+      tags: [payments]
+      summary: Registrar estorno manual de uma charge manual paga (ledger-only)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - name: charge_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              properties:
+                amount:
+                  type: number
+                  exclusiveMinimum: 0
+                  description: Valor a estornar em reais (full quando omitido; partial na faixa (0, charge.amount_total])
+                reason: { type: string, minLength: 1, maxLength: 500 }
+      responses:
+        "201":
+          description: Estorno manual registrado (succeeded)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  refund:
+                    type: object
+                    properties:
+                      status: { type: string }
+                      amount: { type: number }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Estorno manual já em andamento para esta charge (contenção; retryable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /api/v1/organizations/{organization_id}/charges/{charge_id}/expire:
+    post:
+      tags: [payments]
+      summary: Expirar manualmente uma charge manual pending (único caminho de expiry)
+      security:
+        - clerkBearer: []
+      parameters:
+        - $ref: "#/components/parameters/OrganizationId"
+        - name: charge_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 1, maxLength: 500 }
+      responses:
+        "200":
+          description: Charge expirada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/webhooks/stripe/connect-return:
+    get:
+      tags: [payments]
+      summary: Redirect de retorno do onboarding Stripe (reconcile + redirect)
+      parameters:
+        - name: org
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "302":
+          description: Redirect para a URL de retorno do onboarding
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+
+  /api/v1/webhooks/stripe/connect-refresh:
+    get:
+      tags: [payments]
+      summary: Redirect de refresh do onboarding Stripe (novo account link)
+      parameters:
+        - name: org
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "302":
+          description: Redirect para um novo account link de onboarding
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+        "404": { $ref: "#/components/responses/NotFound" }
