@@ -43,7 +43,7 @@
     "@opentelemetry/exporter-trace-otlp-http": "^0.215.0",
     "@opentelemetry/resources": "^2.7.0",
     "@opentelemetry/sdk-node": "^0.215.0",
-    "@opentelemetry/semantic-conventions": "^1.40.0",
+    "@opentelemetry/semantic-conventions": "^1.44.0",
     "@sentry/node": "^10.50.0",
     "bcrypt": "^6.0.0",
     "bullmq": "5",
