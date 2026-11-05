@@ -4,7 +4,7 @@ The domain API and **execution control plane** behind an AI agent platform. Mess
 
 It is the business backend of **Bevox**, an AI secretary for appointment-based businesses (clinics first), built by one person. Messaging goes through [bevox-meta-api](https://github.com/bernardTavares/bevox-meta-api).
 
-> **Status:** v1.0.1. Published as a reference design for an agent control plane. The autonomous audit reports are in `docs/audits/`.
+> **Status:** v1.0.1. Published as a reference design for an agent control plane.
 
 ## The core idea: the backend owns state, the harness owns reasoning
 
