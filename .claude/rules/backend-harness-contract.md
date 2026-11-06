@@ -32,7 +32,7 @@ Endpoints em `src/modules/executions/routes.ts`:
 
 | Endpoint | Quando | Body |
 |---|---|---|
-| `POST /v1/executions/:id/status` | mudança de status (running/done/error/dead_letter) | `{ status, meta? }` |
+| `PATCH /v1/executions/:id/status` | mudança de status (running/done/error/dead_letter) | `{ status, meta? }` |
 | `POST /v1/executions/:id/traces` | trace estruturado (tool call, reasoning step) | `{ trace }` |
 | `POST /v1/executions/:id/stream` | streaming de tokens LLM | `{ chunk }` |
 | `POST /v1/executions/:id/complete` | desfecho terminal | `{ result, proposals?, strategy }` |

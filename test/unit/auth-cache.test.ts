@@ -33,7 +33,7 @@ vi.mock("@/lib/cache.js", () => ({
 // password_hash + mfa_secret são DB-direct (não cacheados).
 const staffMetadataRow = {
   id: "staff-1",
-  email: "staff@bevox.io",
+  email: "staff@example.com",
   full_name: "Staff One",
   role: "bevox_admin" as const,
   active: true,
@@ -80,24 +80,24 @@ afterEach(() => vi.restoreAllMocks());
 
 describe("staff_accounts cache wiring", () => {
   it("findActiveStaffByEmail calls cacheAside with namespace=staff-account-by-email", async () => {
-    await findActiveStaffByEmail("staff@bevox.io");
+    await findActiveStaffByEmail("staff@example.com");
     expect(cache.cacheAside).toHaveBeenCalledOnce();
     const call = (cache.cacheAside as ReturnType<typeof vi.fn>).mock.calls[0];
     if (!call) throw new Error("expected cacheAside to be called");
-    expect(call[0]).toBe("staff@bevox.io");
+    expect(call[0]).toBe("staff@example.com");
     expect(call[1].namespace).toBe("staff-account-by-email");
     // Spec: TTL=300s; assert ≥ 60 to leave headroom for future tuning.
     expect(call[1].ttlSeconds).toBeGreaterThanOrEqual(60);
   });
 
   it("findActiveStaffByEmail returns metadata-only shape (NO password_hash, NO mfa_secret)", async () => {
-    const row = await findActiveStaffByEmail("staff@bevox.io");
+    const row = await findActiveStaffByEmail("staff@example.com");
     expect(row).not.toBeNull();
     if (!row) throw new Error("expected row");
     // Shape: id, email, full_name, role, active. SECRETS NÃO devem aparecer.
     expect(row).toEqual({
       id: "staff-1",
-      email: "staff@bevox.io",
+      email: "staff@example.com",
       full_name: "Staff One",
       role: "bevox_admin",
       active: true,

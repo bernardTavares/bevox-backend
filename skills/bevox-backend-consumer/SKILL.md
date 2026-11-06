@@ -52,8 +52,8 @@ bevox-harness (callbacks) ─X-Exec-Tok──┘        ▲                     
 | painel staff (staff Bevox) | `staffBearer` | `Authorization: Bearer <JWT staff HS256>` | Roles `bevox_admin` \| `bevox_support` \| `bevox_observer` (ADR-013). Sessão via `POST /api/v1/staff/sessions`; refresh rotativo. |
 | `bevox-harness` (callbacks) | `executionToken` | `X-Execution-Token: <token efêmero>` | Token por execução; só os 4 callbacks `/api/v1/executions/:id/*`. |
 
-Toda mutação (`POST/PUT/PATCH/DELETE`, exceto health) exige
-`Idempotency-Key`. Endpoints scoped exigem `:organization_id` no path; o
+Rotas de mutação sensíveis (pagamentos, reembolsos, agendamentos) aceitam
+`Idempotency-Key` (plugin opt-in por rota); envie-o sempre em mutações. Endpoints scoped exigem `:organization_id` no path; o
 plugin `organization-scope` rejeita acesso fora do escopo do principal.
 
 ## Superfície (Marco 1)
@@ -67,9 +67,10 @@ plugin `organization-scope` rejeita acesso fora do escopo do principal.
   `users` + `onboarding` + `onboarding/advance`; `professionals`;
   `services` (+ `services/:id/professionals`); `customers`. Mais
   `customers/:id/profile` e `customers/:id/facts`.
-- **AISuggestions:** `GET|POST /api/v1/organizations/:organization_id/suggestions`.
-  Toda suggestion nasce `pending` — aprovação humana obrigatória (ADR-007
-  canon).
+- **Aprovações:** `GET /api/v1/organizations/:organization_id/executions`
+  e `POST .../executions/:id/approve | /edit | /reject`. Uma execução em
+  `waiting_approval` só age após decisão humana; propostas de cobrança ou
+  reembolso sempre exigem aprovação.
 - **Callbacks do harness:** `PATCH /api/v1/executions/:id/status`,
   `POST .../traces`, `POST .../stream`, `POST .../complete`.
 
@@ -83,9 +84,11 @@ enfileira em BullMQ na fila `bevox.execution.dispatch` (jobId =
 `DispatchPayload`.
 
 **Callbacks (harness → backend):** o harness autentica via
-`X-Execution-Token` e chama os 4 endpoints acima. Em Marco 1, `traces`,
-`stream` e `complete` são stubs que aceitam-e-confirmam; `status` aplica a
-transição de estado; persistência/SSE plenos chegam em Marco 2 (ADR-011).
+`X-Execution-Token` e chama os 4 endpoints acima. `status` aplica a
+transição de estado, `traces` persiste os traces, `stream` publica chunks em
+tempo real e `complete` entrega o resultado ou o retém em
+`waiting_approval`, conforme o modo de autonomia. O token é amarrado à
+própria execução: `:id` diferente do da execução do token → 403.
 
 ### Nota de fronteira — contrato harness `organization_id`-native
 
@@ -101,7 +104,7 @@ falam `organization_id` com a backend.
 
 1. **`organization_id` é o eixo de tenancy.** Endpoint scoped sem o path
    param correto = 403. Nunca tente acessar dados cross-organization.
-2. **`Idempotency-Key` obrigatório** em toda mutação, derivado de evento de
+2. **Envie `Idempotency-Key`** em toda mutação, derivado de evento de
    domínio (não aleatório).
 3. **Use o auth certo para o seu papel.** Cliente-final = Clerk JWT; staff
    = staff JWT; harness callback = `X-Execution-Token`. Nunca cruze.
